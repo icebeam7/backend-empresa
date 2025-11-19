@@ -33,6 +33,8 @@ public static class ContactosEndpoints
         // Actualizar
         group.MapPut("/{id:int}", async (int id, Contacto entrada, ContactosDbContext db) =>
         {
+            if (id != entrada.ID) return Results.BadRequest();
+            
             var existente = await db.Contactos.FirstOrDefaultAsync(c => c.ID == id);
             if (existente is null) return Results.NotFound();
 
