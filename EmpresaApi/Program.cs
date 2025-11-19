@@ -34,3 +34,6 @@ app.MapGet("/", () => "API Empresa - Contactos");
 app.MapContactosEndpoints();
 
 app.Run();
+
+// Make the Program class accessible for integration tests
+public partial class Program { }
