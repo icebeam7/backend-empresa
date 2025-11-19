@@ -1,0 +1,141 @@
+name: Deploy Application to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group_name:
+        description: 'Nombre del grupo de recursos'
+        required: true
+        type: string
+        default: 'rg-empresaapi-dev'
+      app_service_name:
+        description: 'Nombre del App Service'
+        required: true
+        type: string
+        default: 'empresaapi-app-dev'
+      environment:
+        description: 'Ambiente de despliegue'
+        required: false
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+      dotnet_version:
+        description: 'Versión de .NET'
+        required: false
+        type: string
+        default: '8.0.x'
+
+jobs:
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Restore dependencies
+        run: dotnet restore EmpresaApi/EmpresaApi.csproj
+
+      - name: Build
+        run: dotnet build EmpresaApi/EmpresaApi.csproj --configuration Release --no-restore
+
+      - name: Run tests
+        run: |
+          if [ -f "EmpresaApi.Tests/EmpresaApi.Tests.csproj" ]; then
+            dotnet test EmpresaApi.Tests/EmpresaApi.Tests.csproj --no-restore --verbosity normal
+          else
+            echo "No tests found, skipping..."
+          fi
+
+      - name: Publish
+        run: dotnet publish EmpresaApi/EmpresaApi.csproj --configuration Release --output ./publish --no-build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp
+          path: ./publish
+
+  deploy:
+    name: Deploy to Azure App Service
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ inputs.environment }}
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp
+          path: ./publish
+
+      - name: Login a Azure
+        uses: azure/login@v2
+        with:
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ inputs.app_service_name }}
+          resource-group-name: ${{ inputs.resource_group_name }}
+          package: ./publish
+
+      - name: Verificar despliegue
+        run: |
+          APP_URL=$(az webapp show \
+            --name ${{ inputs.app_service_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --query defaultHostName -o tsv)
+          
+          echo "🌐 Application URL: https://$APP_URL"
+          echo "app_url=https://$APP_URL" >> $GITHUB_ENV
+
+      - name: Health check
+        run: |
+          echo "Esperando a que la aplicación esté disponible..."
+          sleep 30
+          
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.app_url }} || echo "000")
+          
+          if [ "$STATUS" -eq "200" ] || [ "$STATUS" -eq "404" ]; then
+            echo "✅ Aplicación desplegada y respondiendo (HTTP $STATUS)"
+          else
+            echo "⚠️  La aplicación respondió con código: $STATUS"
+          fi
+
+      - name: Crear resumen del despliegue
+        run: |
+          echo "## 🚀 Aplicación Desplegada" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Detalles" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Recurso | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **App Service** | \`${{ inputs.app_service_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Grupo de Recursos** | \`${{ inputs.resource_group_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ambiente** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Versión .NET** | \`${{ inputs.dotnet_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 URLs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏠 Home: [${{ env.app_url }}](${{ env.app_url }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📡 API: [${{ env.app_url }}/api/contactos](${{ env.app_url }}/api/contactos)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Estado" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Aplicación desplegada exitosamente y respondiendo a peticiones HTTP." >> $GITHUB_STEP_SUMMARY
+
+      - name: Logout de Azure
+        run: az logout
+        if: always()

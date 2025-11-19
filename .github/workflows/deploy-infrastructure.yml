@@ -1,0 +1,209 @@
+name: Deploy Azure Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group_name:
+        description: 'Nombre del grupo de recursos de Azure'
+        required: true
+        type: string
+        default: 'rg-empresaapi-dev'
+      location:
+        description: 'Ubicación de Azure'
+        required: true
+        type: choice
+        options:
+          - eastus
+          - eastus2
+          - westus
+          - westus2
+          - centralus
+          - northeurope
+          - westeurope
+          - southeastasia
+          - brazilsouth
+        default: 'eastus'
+      resource_base_name:
+        description: 'Nombre base para los recursos'
+        required: true
+        type: string
+        default: 'empresaapi'
+      app_service_plan_sku:
+        description: 'SKU/Tier del App Service Plan'
+        required: true
+        type: choice
+        options:
+          - F1
+          - B1
+          - B2
+          - S1
+          - S2
+          - P1V2
+          - P2V2
+        default: 'F1'
+      environment:
+        description: 'Ambiente de despliegue'
+        required: false
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+      create_resource_group:
+        description: 'Crear grupo de recursos si no existe'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+jobs:
+  validate:
+    name: Validar Template de Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login a Azure
+        uses: azure/login@v2
+        with:
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validar sintaxis de Bicep
+        run: |
+          az bicep build --file infrastructure.bicep
+
+      - name: Validar template en Azure
+        run: |
+          az deployment group validate \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file infrastructure.bicep \
+            --parameters \
+              resourceBaseName=${{ inputs.resource_base_name }} \
+              location=${{ inputs.location }} \
+              appServicePlanSku=${{ inputs.app_service_plan_sku }} \
+              environment=${{ inputs.environment }} \
+            || echo "El grupo de recursos aún no existe, se creará en el siguiente job"
+
+  deploy:
+    name: Desplegar Infraestructura
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ inputs.environment }}
+    outputs:
+      app_service_name: ${{ steps.deploy.outputs.appServiceName }}
+      app_service_url: ${{ steps.deploy.outputs.appServiceUrl }}
+      app_service_plan_name: ${{ steps.deploy.outputs.appServicePlanName }}
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login a Azure
+        uses: azure/login@v2
+        with:
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Crear grupo de recursos
+        if: ${{ inputs.create_resource_group }}
+        run: |
+          az group create \
+            --name ${{ inputs.resource_group_name }} \
+            --location ${{ inputs.location }} \
+            --tags environment=${{ inputs.environment }} project=empresa-api
+
+      - name: Desplegar infraestructura con Bicep
+        id: deploy
+        run: |
+          DEPLOYMENT_NAME="deployment-$(date +%Y%m%d-%H%M%S)"
+          
+          az deployment group create \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file infrastructure.bicep \
+            --parameters \
+              resourceBaseName=${{ inputs.resource_base_name }} \
+              location=${{ inputs.location }} \
+              appServicePlanSku=${{ inputs.app_service_plan_sku }} \
+              environment=${{ inputs.environment }} \
+            --name $DEPLOYMENT_NAME
+          
+          # Obtener outputs del despliegue
+          APP_SERVICE_NAME=$(az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServiceName.value -o tsv)
+          
+          APP_SERVICE_URL=$(az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServiceUrl.value -o tsv)
+          
+          APP_SERVICE_PLAN_NAME=$(az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServicePlanName.value -o tsv)
+          
+          # Exportar outputs
+          echo "appServiceName=$APP_SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "appServiceUrl=$APP_SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "appServicePlanName=$APP_SERVICE_PLAN_NAME" >> $GITHUB_OUTPUT
+
+      - name: Verificar recursos creados
+        run: |
+          echo "✅ Infraestructura desplegada exitosamente"
+          echo "📦 Grupo de recursos: ${{ inputs.resource_group_name }}"
+          echo "📍 Ubicación: ${{ inputs.location }}"
+          echo "🎯 Ambiente: ${{ inputs.environment }}"
+          echo "📋 App Service Plan: ${{ steps.deploy.outputs.appServicePlanName }}"
+          echo "🚀 App Service: ${{ steps.deploy.outputs.appServiceName }}"
+          echo "🌐 URL: ${{ steps.deploy.outputs.appServiceUrl }}"
+
+      - name: Crear resumen del despliegue
+        run: |
+          echo "## 🎉 Despliegue de Infraestructura Completado" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Detalles del Despliegue" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Recurso | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Grupo de Recursos** | \`${{ inputs.resource_group_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ubicación** | \`${{ inputs.location }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ambiente** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **App Service Plan** | \`${{ steps.deploy.outputs.appServicePlanName }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SKU** | \`${{ inputs.app_service_plan_sku }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **App Service** | \`${{ steps.deploy.outputs.appServiceName }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 URL de Acceso" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [${{ steps.deploy.outputs.appServiceUrl }}](${{ steps.deploy.outputs.appServiceUrl }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Próximos Pasos" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Desplegar la aplicación al App Service" >> $GITHUB_STEP_SUMMARY
+          echo "2. Configurar variables de entorno adicionales si es necesario" >> $GITHUB_STEP_SUMMARY
+          echo "3. Configurar custom domain (opcional)" >> $GITHUB_STEP_SUMMARY
+          echo "4. Configurar SSL certificate (opcional)" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Notificar Resultado
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    steps:
+      - name: Notificar éxito
+        if: needs.deploy.result == 'success'
+        run: |
+          echo "✅ Infraestructura desplegada exitosamente"
+          echo "🌐 URL: ${{ needs.deploy.outputs.app_service_url }}"
+      
+      - name: Notificar fallo
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "❌ El despliegue de infraestructura falló"
+          echo "Por favor revisa los logs para más detalles"
+          exit 1

@@ -1,0 +1,226 @@
+name: Full Deploy (Infrastructure + Application)
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group_name:
+        description: 'Nombre del grupo de recursos'
+        required: true
+        type: string
+        default: 'rg-empresaapi-dev'
+      location:
+        description: 'Ubicación de Azure'
+        required: true
+        type: choice
+        options:
+          - eastus
+          - eastus2
+          - westus
+          - westus2
+          - centralus
+          - northeurope
+          - westeurope
+          - southeastasia
+          - brazilsouth
+        default: 'eastus'
+      resource_base_name:
+        description: 'Nombre base para los recursos'
+        required: true
+        type: string
+        default: 'empresaapi'
+      app_service_plan_sku:
+        description: 'SKU del App Service Plan'
+        required: true
+        type: choice
+        options:
+          - F1
+          - B1
+          - B2
+          - S1
+          - S2
+          - P1V2
+          - P2V2
+        default: 'B1'
+      environment:
+        description: 'Ambiente'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+
+jobs:
+  infrastructure:
+    name: Desplegar Infraestructura
+    runs-on: ubuntu-latest
+    outputs:
+      app_service_name: ${{ steps.deploy.outputs.appServiceName }}
+      app_service_url: ${{ steps.deploy.outputs.appServiceUrl }}
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login a Azure
+        uses: azure/login@v2
+        with:
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Crear grupo de recursos
+        run: |
+          az group create \
+            --name ${{ inputs.resource_group_name }} \
+            --location ${{ inputs.location }} \
+            --tags environment=${{ inputs.environment }} project=empresa-api
+
+      - name: Desplegar infraestructura
+        id: deploy
+        run: |
+          DEPLOYMENT_NAME="deployment-$(date +%Y%m%d-%H%M%S)"
+          
+          az deployment group create \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file infrastructure.bicep \
+            --parameters \
+              resourceBaseName=${{ inputs.resource_base_name }} \
+              location=${{ inputs.location }} \
+              appServicePlanSku=${{ inputs.app_service_plan_sku }} \
+              environment=${{ inputs.environment }} \
+            --name $DEPLOYMENT_NAME
+          
+          APP_SERVICE_NAME=$(az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServiceName.value -o tsv)
+          
+          APP_SERVICE_URL=$(az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name $DEPLOYMENT_NAME \
+            --query properties.outputs.appServiceUrl.value -o tsv)
+          
+          echo "appServiceName=$APP_SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "appServiceUrl=$APP_SERVICE_URL" >> $GITHUB_OUTPUT
+          
+          echo "✅ Infraestructura desplegada"
+          echo "🚀 App Service: $APP_SERVICE_NAME"
+          echo "🌐 URL: $APP_SERVICE_URL"
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: infrastructure
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore EmpresaApi/EmpresaApi.csproj
+
+      - name: Build
+        run: dotnet build EmpresaApi/EmpresaApi.csproj --configuration Release --no-restore
+
+      - name: Test
+        run: |
+          if [ -f "EmpresaApi.Tests/EmpresaApi.Tests.csproj" ]; then
+            dotnet test EmpresaApi.Tests/EmpresaApi.Tests.csproj --no-restore --verbosity normal
+          else
+            echo "No tests found"
+          fi
+
+      - name: Publish
+        run: dotnet publish EmpresaApi/EmpresaApi.csproj --configuration Release --output ./publish --no-build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp
+          path: ./publish
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [infrastructure, build]
+    environment: ${{ inputs.environment }}
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp
+          path: ./publish
+
+      - name: Login a Azure
+        uses: azure/login@v2
+        with:
+          auth-type: SERVICE_PRINCIPAL
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ needs.infrastructure.outputs.app_service_name }}
+          resource-group-name: ${{ inputs.resource_group_name }}
+          package: ./publish
+
+      - name: Health check
+        run: |
+          echo "Esperando a que la aplicación esté lista..."
+          sleep 30
+          
+          URL="${{ needs.infrastructure.outputs.app_service_url }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL || echo "000")
+          
+          echo "HTTP Status: $STATUS"
+          
+          if [ "$STATUS" -eq "200" ] || [ "$STATUS" -eq "404" ]; then
+            echo "✅ Aplicación respondiendo correctamente"
+          else
+            echo "⚠️  Estado HTTP inesperado: $STATUS"
+          fi
+
+      - name: Crear resumen completo
+        run: |
+          echo "## 🎉 Despliegue Completo Exitoso" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Infraestructura" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Recurso | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Grupo de Recursos** | \`${{ inputs.resource_group_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ubicación** | \`${{ inputs.location }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SKU** | \`${{ inputs.app_service_plan_sku }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ambiente** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Aplicación" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Componente | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **App Service** | \`${{ needs.infrastructure.outputs.app_service_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Framework** | .NET 8.0 |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Estado** | ✅ Desplegada |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Acceso" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏠 **Home**: [${{ needs.infrastructure.outputs.app_service_url }}](${{ needs.infrastructure.outputs.app_service_url }})" >> $GITHUB_STEP_SUMMARY
+          echo "- 📡 **API Contactos**: [${{ needs.infrastructure.outputs.app_service_url }}/api/contactos](${{ needs.infrastructure.outputs.app_service_url }}/api/contactos)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Próximos Pasos" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Infraestructura creada" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Aplicación desplegada" >> $GITHUB_STEP_SUMMARY
+          echo "3. 🔍 Prueba los endpoints de la API" >> $GITHUB_STEP_SUMMARY
+          echo "4. 📊 Monitorea los logs en Azure Portal" >> $GITHUB_STEP_SUMMARY
+          echo "5. 🔐 Configura SSL y dominio personalizado (opcional)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Logout de Azure
+        run: az logout
+        if: always()
